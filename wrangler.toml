@@ -1,0 +1,5 @@
+name = "mi-worker"
+type = "javascript"
+account_id = "12c26f3ebd25b7a37bd0b48a00b2f90a"
+workers_dev = true
+main = "worker.js"
