@@ -1,0 +1,168 @@
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
+
+    const auth = request.headers.get('Authorization');
+    if (auth !== `Bearer ${env.INTERNAL_TOKEN}`) {
+      return jsonRpcError(null, -32001, 'Unauthorized');
+    }
+
+    const url = new URL(request.url);
+
+    // Endpoint MCP (JSON-RPC 2.0)
+    if (url.pathname === '/mcp') {
+      const body = await request.json();
+      return handleMcp(body, env);
+    }
+
+    // Endpoint HTTP simple (para pruebas con curl)
+    if (url.pathname === '/exec') {
+      const { action, params } = await request.json();
+      const result = await ejecutar(env, action, params || {});
+      return jsonRpc(result);
+    }
+
+    return new Response('Not found', { status: 404 });
+  }
+};
+
+async function handleMcp(body, env) {
+  const { id, method, params } = body;
+
+  if (method === 'initialize') {
+    return jsonRpcResponse(id, {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'cf-tool', version: '1.0.0' }
+    });
+  }
+
+  if (method === 'tools/list') {
+    return jsonRpcResponse(id, {
+      tools: [{
+        name: 'cloudflare_execute',
+        description: 'Ejecuta operaciones en Cloudflare. Usa action + params. Acciones: list_workers, get_worker, deploy_worker, delete_worker, list_kv, get_kv, put_kv, delete_kv, list_d1, query_d1, list_pages, get_usage.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['list_workers','get_worker','get_worker_content','deploy_worker','delete_worker','list_kv','get_kv','put_kv','delete_kv','list_d1','query_d1','list_pages','get_usage']
+            },
+            params: { type: 'object', description: 'Parámetros específicos de la acción' }
+          },
+          required: ['action']
+        }
+      }]
+    });
+  }
+
+  if (method === 'tools/call') {
+    if (params.name !== 'cloudflare_execute') return jsonRpcError(id, -32601, 'Unknown tool');
+    const { action, params: actionParams } = params.arguments || {};
+    const result = await ejecutar(env, action, actionParams || {});
+    return jsonRpcResponse(id, {
+      content: [{ type: 'text', text: JSON.stringify(result) }]
+    });
+  }
+
+  return jsonRpcError(id, -32601, 'Method not found: ' + method);
+}
+
+async function ejecutar(env, action, p) {
+  const CF_API = 'https://api.cloudflare.com/client/v4';
+  const ACCOUNT = env.CF_ACCOUNT_ID;
+  const headers = { 'Authorization': `Bearer ${env.CF_API_TOKEN}`, 'Content-Type': 'application/json' };
+
+  try {
+    switch (action) {
+      case 'list_workers': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/workers/scripts`, { headers });
+        return await r.json();
+      }
+      case 'get_worker': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/workers/scripts/${p.name}`, { headers });
+        return await r.json();
+      }
+      case 'get_worker_content': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/workers/scripts/${p.name}/content`, { headers });
+        return { content: await r.text() };
+      }
+      case 'deploy_worker': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/workers/scripts/${p.name}`, {
+          method: 'PUT',
+          headers: { ...headers, 'Content-Type': 'application/javascript' },
+          body: p.code
+        });
+        return await r.json();
+      }
+      case 'delete_worker': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/workers/scripts/${p.name}`, { method: 'DELETE', headers });
+        return { ok: r.ok, status: r.status };
+      }
+      case 'list_kv': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/storage/kv/namespaces`, { headers });
+        return await r.json();
+      }
+      case 'get_kv': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/storage/kv/namespaces/${p.namespace_id}/values/${p.key}`, { headers });
+        return { value: await r.text() };
+      }
+      case 'put_kv': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/storage/kv/namespaces/${p.namespace_id}/values/${p.key}`, {
+          method: 'PUT', headers: { ...headers, 'Content-Type': 'text/plain' }, body: p.value
+        });
+        return { ok: r.ok };
+      }
+      case 'delete_kv': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/storage/kv/namespaces/${p.namespace_id}/values/${p.key}`, { method: 'DELETE', headers });
+        return { ok: r.ok };
+      }
+      case 'list_d1': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/d1/database`, { headers });
+        return await r.json();
+      }
+      case 'query_d1': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/d1/database/${p.database_id}/query`, {
+          method: 'POST', headers, body: JSON.stringify({ sql: p.sql, params: p.params || [] })
+        });
+        return await r.json();
+      }
+      case 'list_pages': {
+        const r = await fetch(`${CF_API}/accounts/${ACCOUNT}/pages/projects`, { headers });
+        return await r.json();
+      }
+      case 'get_usage': {
+        const query = `{ viewer { accounts(filter: {accountTag: "${ACCOUNT}"}) { workersInvocationsAdaptive(limit: 100) { sum { requests errors } } } } }`;
+        const r = await fetch(`${CF_API}/graphql`, {
+          method: 'POST', headers, body: JSON.stringify({ query })
+        });
+        return await r.json();
+      }
+      default:
+        return { error: 'Unknown action: ' + action };
+    }
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function jsonRpc(data) {
+  return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+}
+
+function jsonRpcResponse(id, result) {
+  return jsonRpc({ jsonrpc: '2.0', id, result });
+}
+
+function jsonRpcError(id, code, message) {
+  return jsonRpc({ jsonrpc: '2.0', id, error: { code, message } });
+}
+
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+  };
+}
